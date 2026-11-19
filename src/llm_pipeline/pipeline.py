@@ -18,7 +18,7 @@ from loguru import logger
 
 from .enhanced_recipe_generator import EnhancedRecipeGenerator
 from .models import EnhancedRecipe, Recipe, Review
-from .recipe_modifier1 import RecipeModifier
+from .recipe_modifier import RecipeModifier
 from .tweak_extractor import TweakExtractor
 
 
