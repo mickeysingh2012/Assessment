@@ -1,33 +1,35 @@
 
+
 """
 Step 2: Recipe Modification
 
-Safely applies structured modifications to recipe ingredients and
-instructions while preserving the original recipe and recording
-only actual changes.
+Apply structured recipe edits safely, preserve the original recipe,
+and record only changes that actually occurred.
+
+Ingredient removals are checked against the final instructions to
+avoid leaving explicit references to removed ingredients.
 """
 
 import copy
+import re
 from difflib import SequenceMatcher
 from typing import List, Optional, Tuple
 
 from loguru import logger
 
 from .models import (
-    ModificationObject,
-    ModificationEdit,
-    Recipe,
     ChangeRecord,
+    ModificationEdit,
+    ModificationObject,
+    Recipe,
 )
 
 
 class RecipeModifier:
-    """Apply validated recipe edits without unsafe fuzzy modifications."""
-
     def __init__(self, similarity_threshold: float = 0.6):
         self.similarity_threshold = similarity_threshold
         logger.info(
-            f"Initialized RecipeModifier with similarity threshold: "
+            "Initialized RecipeModifier with similarity threshold: "
             f"{similarity_threshold}"
         )
 
@@ -36,12 +38,7 @@ class RecipeModifier:
         target: str,
         candidates: List[str],
     ) -> Tuple[Optional[str], Optional[int], float]:
-        """
-        Find the closest candidate for diagnostics.
-
-        This method preserves the original public interface.
-        Fuzzy matches are NOT automatically accepted for edits.
-        """
+        """Find the closest candidate for diagnostic purposes."""
         if not target or not candidates:
             return None, None, 0.0
 
@@ -71,18 +68,10 @@ class RecipeModifier:
         target: str,
         candidates: List[str],
     ) -> Tuple[Optional[int], Optional[str]]:
-        """
-        Locate a target safely.
-
-        First prefer an exact list-entry match.
-        Then allow a literal substring match within one entry.
-
-        Reject ambiguous matches to avoid editing the wrong item.
-        """
+        """Find one exact entry or one unambiguous substring match."""
         if not target or not target.strip():
             return None, None
 
-        # Prefer a full entry match.
         full_matches = [
             index
             for index, candidate in enumerate(candidates)
@@ -100,8 +89,6 @@ class RecipeModifier:
             )
             return None, None
 
-        # Permit a literal substring in a longer instruction
-        # or ingredient entry, but never a fuzzy-only match.
         substring_matches = [
             index
             for index, candidate in enumerate(candidates)
@@ -120,20 +107,94 @@ class RecipeModifier:
 
         return None, None
 
+    def _ingredient_name(self, ingredient: str) -> str:
+        """
+        Remove a leading quantity and measurement unit.
+
+        Example:
+            '2 teaspoons hot water' -> 'hot water'
+
+        This is a heuristic, not full ingredient parsing.
+        """
+        name = ingredient.lower().strip()
+
+        name = re.sub(
+            r"^\s*[\d./¼½¾⅓⅔⅛⅜⅝⅞\s-]+\s*"
+            r"(?:cups?|tablespoons?|tbsp|teaspoons?|tsp|"
+            r"ounces?|oz|grams?|g|ml|liters?|l)?\s*",
+            "",
+            name,
+        ).strip()
+
+        return name
+
+    def _ingredient_referenced_in_instructions(
+        self,
+        ingredient: str,
+        instructions: List[str],
+    ) -> bool:
+        """
+        Detect explicit ingredient references in instructions.
+
+        Supports complete ingredient names and names with common
+        leading preparation descriptors removed.
+
+        This remains a conservative heuristic. It does not attempt
+        semantic matching or synonym detection.
+        """
+        ingredient_name = self._ingredient_name(ingredient)
+
+        if not ingredient_name:
+            return False
+
+        preparation_descriptors = {
+            "chopped",
+            "diced",
+            "minced",
+            "sliced",
+            "shredded",
+            "grated",
+            "crushed",
+            "ground",
+            "finely",
+            "roughly",
+            "freshly",
+        }
+
+        words = ingredient_name.split()
+
+        candidate_names = {ingredient_name}
+
+        # Remove leading preparation descriptors while preserving
+        # the original complete ingredient name.
+        while words and words[0] in preparation_descriptors:
+            words = words[1:]
+
+            if words:
+                candidate_names.add(" ".join(words))
+
+        for candidate in candidate_names:
+            pattern = (
+                r"(?<!\w)"
+                + re.escape(candidate)
+                + r"(?!\w)"
+            )
+
+            if any(
+                re.search(pattern, instruction.lower())
+                is not None
+                for instruction in instructions
+            ):
+                return True
+
+        return False
+
     def apply_edit(
         self,
         edit: ModificationEdit,
         recipe_content: List[str],
     ) -> Tuple[List[str], List[ChangeRecord]]:
-        """
-        Apply one edit safely.
-
-        Returns:
-            (modified_content, change_records)
-
-        No-op, invalid, ambiguous, and fuzzy-only edits return
-        unchanged content and an empty list of change records.
-        """
+        """Apply one edit to a copy of an ingredient or instruction list."""
         modified_content = copy.deepcopy(recipe_content)
         change_records: List[ChangeRecord] = []
 
@@ -168,14 +229,11 @@ class RecipeModifier:
                 return modified_content, change_records
 
             original_text = modified_content[index]
-
-            # Replace only the literal text requested.
             new_text = original_text.replace(
                 edit.find,
                 edit.replace,
             )
 
-            # Never count unchanged content as a modification.
             if new_text == original_text:
                 logger.info(
                     f"Skipping no-op replacement: '{edit.find}'"
@@ -205,8 +263,6 @@ class RecipeModifier:
                 )
                 return modified_content, change_records
 
-            # Avoid adding an identical entry twice immediately
-            # after the same anchor.
             next_index = index + 1
 
             if (
@@ -234,9 +290,6 @@ class RecipeModifier:
             )
 
         elif edit.operation == "remove":
-            # Removal requires the complete entry to match.
-            # Never delete an ingredient based on a partial
-            # phrase or a fuzzy match.
             if matched_text != edit.find:
                 logger.warning(
                     f"Skipping unsafe removal: '{edit.find}' "
@@ -255,9 +308,7 @@ class RecipeModifier:
                 )
             )
 
-            logger.info(
-                f"Removed '{removed_text}'"
-            )
+            logger.info(f"Removed '{removed_text}'")
 
         else:
             logger.warning(
@@ -271,19 +322,35 @@ class RecipeModifier:
         recipe: Recipe,
         modification: ModificationObject,
     ) -> Tuple[Recipe, List[ChangeRecord]]:
-        """Apply all edits from one modification to a recipe copy."""
+        """
+        Apply all edits to a recipe copy.
+
+        After applying the edits, reject ingredient removals that
+        leave explicit references in the final instructions.
+
+        Valid unrelated edits are preserved.
+        """
         logger.info(
             f"Applying {modification.modification_type} "
             f"with {len(modification.edits)} edits"
         )
 
         modified_recipe = copy.deepcopy(recipe)
-        modified_recipe.recipe_id = f"{recipe.recipe_id}_modified"
+        modified_recipe.recipe_id = (
+            f"{recipe.recipe_id}_modified"
+        )
 
         all_change_records: List[ChangeRecord] = []
 
+        # Track successful removals, including original positions.
+        removed_ingredients = []
+
         for edit in modification.edits:
             if edit.target == "ingredients":
+                before_ingredients = (
+                    modified_recipe.ingredients.copy()
+                )
+
                 (
                     modified_recipe.ingredients,
                     change_records,
@@ -291,6 +358,24 @@ class RecipeModifier:
                     edit,
                     modified_recipe.ingredients,
                 )
+
+                if (
+                    edit.operation == "remove"
+                    and change_records
+                ):
+                    removed_text = change_records[0].from_text
+
+                    removed_ingredients.append(
+                        {
+                            "text": removed_text,
+                            "original_index": (
+                                before_ingredients.index(
+                                    removed_text
+                                )
+                            ),
+                            "records": change_records,
+                        }
+                    )
 
             elif edit.target == "instructions":
                 (
@@ -309,6 +394,38 @@ class RecipeModifier:
 
             all_change_records.extend(change_records)
 
+        # Evaluate ingredient removals after instruction edits.
+        for removal in reversed(removed_ingredients):
+            ingredient = removal["text"]
+
+            # If another edit reintroduced the ingredient,
+            # the removal no longer leaves it absent.
+            if ingredient in modified_recipe.ingredients:
+                continue
+
+            if self._ingredient_referenced_in_instructions(
+                ingredient,
+                modified_recipe.instructions,
+            ):
+                logger.warning(
+                    f"Rejecting removal of '{ingredient}': "
+                    "still referenced in cooking instructions"
+                )
+
+                insertion_index = min(
+                    removal["original_index"],
+                    len(modified_recipe.ingredients),
+                )
+
+                modified_recipe.ingredients.insert(
+                    insertion_index,
+                    ingredient,
+                )
+
+                for record in removal["records"]:
+                    if record in all_change_records:
+                        all_change_records.remove(record)
+
         logger.info(
             f"Applied modification: "
             f"{len(all_change_records)} actual changes made"
@@ -321,7 +438,7 @@ class RecipeModifier:
         recipe: Recipe,
         modifications: List[ModificationObject],
     ) -> Tuple[Recipe, List[List[ChangeRecord]]]:
-        """Apply multiple modifications sequentially."""
+        """Apply multiple modifications in sequence."""
         current_recipe = recipe
         all_change_records: List[List[ChangeRecord]] = []
 
@@ -335,9 +452,11 @@ class RecipeModifier:
                 f"{index + 1}/{len(modifications)}"
             )
 
-            current_recipe, changes = self.apply_modification(
-                current_recipe,
-                modification,
+            current_recipe, changes = (
+                self.apply_modification(
+                    current_recipe,
+                    modification,
+                )
             )
 
             all_change_records.append(changes)
@@ -349,19 +468,19 @@ class RecipeModifier:
         modification: ModificationObject,
         recipe: Recipe,
     ) -> Tuple[bool, List[str]]:
-        """
-        Validate whether edits can be safely applied.
-
-        Uses the same matching rules as apply_edit().
-        """
+        """Validate edit targets and basic edit safety."""
         warnings: List[str] = []
 
         for edit in modification.edits:
-            target_content = (
-                recipe.ingredients
-                if edit.target == "ingredients"
-                else recipe.instructions
-            )
+            if edit.target == "ingredients":
+                target_content = recipe.ingredients
+            elif edit.target == "instructions":
+                target_content = recipe.instructions
+            else:
+                warnings.append(
+                    f"Unknown edit target: '{edit.target}'"
+                )
+                continue
 
             index, matched_text = self._find_exact_target(
                 edit.find,
@@ -376,15 +495,20 @@ class RecipeModifier:
                 continue
 
             if edit.operation == "replace":
-                if edit.replace is None or not edit.replace.strip():
+                if (
+                    edit.replace is None
+                    or not edit.replace.strip()
+                ):
                     warnings.append(
                         f"Missing replacement for '{edit.find}'"
                     )
+
                 elif (
                     matched_text.replace(
                         edit.find,
                         edit.replace,
-                    ) == matched_text
+                    )
+                    == matched_text
                 ):
                     warnings.append(
                         f"No-op replacement for '{edit.find}'"
@@ -401,5 +525,25 @@ class RecipeModifier:
                     warnings.append(
                         f"Unsafe partial removal: '{edit.find}'"
                     )
+
+                elif (
+                    edit.target == "ingredients"
+                    and self._ingredient_referenced_in_instructions(
+                        matched_text,
+                        recipe.instructions,
+                    )
+                ):
+                    # Preliminary diagnostic only.
+                    # The final check happens in apply_modification
+                    # after all instruction edits have been applied.
+                    logger.debug(
+                        f"Ingredient '{matched_text}' is "
+                        "referenced in the original instructions"
+                    )
+
+            else:
+                warnings.append(
+                    f"Unsupported operation: '{edit.operation}'"
+                )
 
         return len(warnings) == 0, warnings
